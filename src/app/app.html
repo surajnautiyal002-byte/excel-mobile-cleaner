@@ -1,9 +1,16 @@
-<h2>Excel Mobile Cleaner</h2>
+<!-- ERROR/SUCCESS MESSAGES -->
+<div class="message error-message" *ngIf="errorMessage">
+  ❌ {{ errorMessage }}
+</div>
+
+<div class="message success-message" *ngIf="successMessage">
+  ✅ {{ successMessage }}
+</div>
 
 <!-- STEP 1 -->
 <div class="step-card">
   <h3>Step 1: Upload Excel File</h3>
-  <p>Select an Excel file (.xls or .xlsx) by dragging it here or clicking.</p>
+  <p>Select an Excel file (.xls or .xlsx) by dragging, clicking, or pasting (Ctrl+V).</p>
 
   <div
     class="drop-zone"
@@ -15,7 +22,7 @@
   >
     <p *ngIf="!fileName">
       Drag & drop Excel file here<br />
-      <small>or click to upload</small>
+      <small>or click to upload or paste file (Ctrl+V)</small>
     </p>
 
     <p *ngIf="fileName">
@@ -26,35 +33,33 @@
     <input
       #fileInput
       type="file"
-      accept=".xls,.xlsx"
+      accept=".xls,.xlsx,.xlsm,.xlsb,.csv,.tsv,.txt,.xml,.ods"
       hidden
       (change)="onFileChange($event)"
     />
   </div>
 </div>
 
+<!-- UPLOAD PROGRESS -->
+<div class="step-card progress-card" *ngIf="isUploading">
+  <h3>📄 Uploading File...</h3>
+  <div class="progress-bar-container">
+    <div class="progress-bar-fill" [style.width.%]="uploadProgress"></div>
+  </div>
+  <p class="progress-text">{{ uploadProgress }}% uploaded</p>
+</div>
+
 <!-- STEP 2 -->
-<div class="step-card" *ngIf="fileName">
-  <h3>Step 2: Select Sheet & Preview</h3>
-  <p>Choose the sheet you want to clean, then click Preview.</p>
+<div class="step-card" *ngIf="fileName && sheetNames.length > 1">
+  <h3>Step 2: Select Sheet</h3>
+  <p>Choose the sheet you want to clean.</p>
 
   <label>Sheet:</label>
-  <select [(ngModel)]="selectedSheet">
+  <select [(ngModel)]="selectedSheet" (change)="previewSheet()">
     <option *ngFor="let s of sheetNames" [value]="s">
       {{ s }}
     </option>
   </select>
-
-  <button (click)="previewSheet()">Preview</button>
-</div>
-
-<!-- PROCESSING FEEDBACK -->
-<div class="step-card" *ngIf="isProcessing">
-  <p><strong>Cleaning data…</strong> {{ progress }}%</p>
-</div>
-
-<div class="step-card" *ngIf="!isProcessing && progress === 100">
-  <p>✅ Cleaning complete. Your file has been downloaded.</p>
 </div>
 
 <!-- STEP 3 -->
@@ -71,8 +76,9 @@
         <td>
           <button
             (click)="setHeaderRow(i)"
-            [style.background]="headerRowIndex === i ? '#4caf50' : ''"
+            [style.background]="headerRowIndex === i ? '#38b2ac' : ''"
             [style.color]="headerRowIndex === i ? 'white' : ''"
+            [style.border-color]="headerRowIndex === i ? '#38b2ac' : ''"
           >
             Header
           </button>
@@ -105,9 +111,47 @@
 
 <!-- STEP 5 -->
 <div class="step-card" *ngIf="headers.length">
-  <h3>Step 5: Clean & Download</h3>
+  <h3>Step 5: Export Options</h3>
+  <p>Choose how you want to export the cleaned data.</p>
+
+  <div class="export-options">
+    <label>
+      <input type="radio" name="exportMode" [(ngModel)]="exportMode" value="full" />
+      Full Data (all columns with cleaned numbers)
+    </label>
+    <label>
+      <input type="radio" name="exportMode" [(ngModel)]="exportMode" value="unique" />
+      Unique Numbers Only (single column, no duplicates)
+    </label>
+    <label>
+      <input type="radio" name="exportMode" [(ngModel)]="exportMode" value="mobile-name" />
+      Mobile Number & Name (two columns, no duplicates)
+    </label>
+  </div>
+
+  <div *ngIf="exportMode === 'mobile-name'" style="margin-top: 15px;">
+    <p>Select the column that contains names:</p>
+    <div class="mobile-columns">
+      <label *ngFor="let h of headers; let i = index">
+        <input
+          type="radio"
+          name="nameColumn"
+          [value]="i"
+          [checked]="selectedNameColumn === i"
+          (change)="selectedNameColumn = i"
+        />
+        <strong *ngIf="selectedNameColumn === i">👤</strong>
+        {{ h }}
+      </label>
+    </div>
+  </div>
+</div>
+
+<!-- STEP 6 -->
+<div class="step-card" *ngIf="headers.length">
+  <h3>Step 6: Clean & Download</h3>
   <p>
-    Invalid rows will be removed. Empty mobile cells may be auto-filled using
+    Invalid rows will be removed. Duplicates will be filtered. Empty mobile cells may be auto-filled using
     valid numbers from the same row.
   </p>
 
@@ -116,6 +160,42 @@
     (click)="cleanAndDownload()"
     [disabled]="isProcessing"
   >
-    Clean Mobile Numbers & Download
+    {{ isProcessing ? `Processing... ${progress}%` : 'Clean Mobile Numbers & Download' }}
   </button>
+
+<!-- PROCESSING PROGRESS -->
+<div class="step-card progress-card" *ngIf="isProcessing && progress > 0">
+  <h3>⏳ Processing...</h3>
+  <div class="progress-bar-container">
+    <div class="progress-bar-fill" [style.width.%]="progress"></div>
+  </div>
+  <p class="progress-text">{{ progress }}% complete - {{ progress < 100 ? 'Please wait...' : 'Generating file...' }}</p>
+</div>
+</div>
+
+<!-- STATISTICS -->
+<div class="step-card stats-card" *ngIf="showStats">
+  <h3>📊 Cleaning Statistics</h3>
+  <div class="stats-grid">
+    <div class="stat-item">
+      <div class="stat-value">{{ stats.total }}</div>
+      <div class="stat-label">Total Rows</div>
+    </div>
+    <div class="stat-item success">
+      <div class="stat-value">{{ stats.valid }}</div>
+      <div class="stat-label">Valid Numbers</div>
+    </div>
+    <div class="stat-item warning">
+      <div class="stat-value">{{ stats.duplicates }}</div>
+      <div class="stat-label">Duplicates Removed</div>
+    </div>
+    <div class="stat-item error">
+      <div class="stat-value">{{ stats.invalidPattern }}</div>
+      <div class="stat-label">Invalid Patterns</div>
+    </div>
+    <div class="stat-item error">
+      <div class="stat-value">{{ stats.invalidLength }}</div>
+      <div class="stat-label">Invalid Length/Format</div>
+    </div>
+  </div>
 </div>
