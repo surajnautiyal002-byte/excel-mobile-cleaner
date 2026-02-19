@@ -1,10 +1,10 @@
-<!-- ERROR/SUCCESS MESSAGES -->
+﻿<!-- ERROR/SUCCESS MESSAGES -->
 <div class="message error-message" *ngIf="errorMessage">
-  ❌ {{ errorMessage }}
+  Error: {{ errorMessage }}
 </div>
 
 <div class="message success-message" *ngIf="successMessage">
-  ✅ {{ successMessage }}
+  Success: {{ successMessage }}
 </div>
 
 <!-- STEP 1 -->
@@ -42,7 +42,7 @@
 
 <!-- UPLOAD PROGRESS -->
 <div class="step-card progress-card" *ngIf="isUploading">
-  <h3>📄 Uploading File...</h3>
+  <h3>Uploading File...</h3>
   <div class="progress-bar-container">
     <div class="progress-bar-fill" [style.width.%]="uploadProgress"></div>
   </div>
@@ -103,7 +103,7 @@
         [checked]="selectedColumns.includes(i)"
         (change)="toggleColumn(i)"
       />
-      <strong *ngIf="selectedColumns.includes(i)">📱</strong>
+      <strong *ngIf="selectedColumns.includes(i)">Selected</strong>
       {{ h }}
     </label>
   </div>
@@ -127,6 +127,10 @@
       <input type="radio" name="exportMode" [(ngModel)]="exportMode" value="mobile-name" />
       Mobile Number & Name (two columns, no duplicates)
     </label>
+    <label>
+      <input type="radio" name="exportMode" [(ngModel)]="exportMode" value="keep-all" />
+      Keep All Rows (do not delete rows, only clean valid numbers)
+    </label>
   </div>
 
   <div *ngIf="exportMode === 'mobile-name'" style="margin-top: 15px;">
@@ -140,7 +144,7 @@
           [checked]="selectedNameColumn === i"
           (change)="selectedNameColumn = i"
         />
-        <strong *ngIf="selectedNameColumn === i">👤</strong>
+        <strong *ngIf="selectedNameColumn === i">Selected</strong>
         {{ h }}
       </label>
     </div>
@@ -150,9 +154,12 @@
 <!-- STEP 6 -->
 <div class="step-card" *ngIf="headers.length">
   <h3>Step 6: Clean & Download</h3>
-  <p>
+  <p *ngIf="exportMode !== 'keep-all'">
     Invalid rows will be removed. Duplicates will be filtered. Empty mobile cells may be auto-filled using
     valid numbers from the same row.
+  </p>
+  <p *ngIf="exportMode === 'keep-all'">
+    No rows will be removed. The app will only clean numbers that can be normalized and keep other values unchanged.
   </p>
 
   <button
@@ -162,40 +169,48 @@
   >
     {{ isProcessing ? `Processing... ${progress}%` : 'Clean Mobile Numbers & Download' }}
   </button>
+</div>
 
 <!-- PROCESSING PROGRESS -->
 <div class="step-card progress-card" *ngIf="isProcessing && progress > 0">
-  <h3>⏳ Processing...</h3>
+  <h3>Processing...</h3>
   <div class="progress-bar-container">
     <div class="progress-bar-fill" [style.width.%]="progress"></div>
   </div>
   <p class="progress-text">{{ progress }}% complete - {{ progress < 100 ? 'Please wait...' : 'Generating file...' }}</p>
 </div>
-</div>
 
 <!-- STATISTICS -->
 <div class="step-card stats-card" *ngIf="showStats">
-  <h3>📊 Cleaning Statistics</h3>
+  <h3>Cleaning Statistics</h3>
   <div class="stats-grid">
     <div class="stat-item">
       <div class="stat-value">{{ stats.total }}</div>
       <div class="stat-label">Total Rows</div>
     </div>
     <div class="stat-item success">
-      <div class="stat-value">{{ stats.valid }}</div>
-      <div class="stat-label">Valid Numbers</div>
+      <button type="button" class="stat-download-btn" (click)="downloadStatReport('valid')">
+        <div class="stat-value">{{ stats.valid }}</div>
+        <div class="stat-label">Valid Numbers</div>
+      </button>
     </div>
     <div class="stat-item warning">
-      <div class="stat-value">{{ stats.duplicates }}</div>
-      <div class="stat-label">Duplicates Removed</div>
+      <button type="button" class="stat-download-btn" (click)="downloadStatReport('duplicates')">
+        <div class="stat-value">{{ stats.duplicates }}</div>
+        <div class="stat-label">Duplicates Removed</div>
+      </button>
     </div>
     <div class="stat-item error">
-      <div class="stat-value">{{ stats.invalidPattern }}</div>
-      <div class="stat-label">Invalid Patterns</div>
+      <button type="button" class="stat-download-btn" (click)="downloadStatReport('invalidPattern')">
+        <div class="stat-value">{{ stats.invalidPattern }}</div>
+        <div class="stat-label">Invalid Patterns</div>
+      </button>
     </div>
     <div class="stat-item error">
-      <div class="stat-value">{{ stats.invalidLength }}</div>
-      <div class="stat-label">Invalid Length/Format</div>
+      <button type="button" class="stat-download-btn" (click)="downloadStatReport('invalidLength')">
+        <div class="stat-value">{{ stats.invalidLength }}</div>
+        <div class="stat-label">Invalid Length/Format</div>
+      </button>
     </div>
   </div>
 </div>

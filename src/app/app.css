@@ -326,6 +326,13 @@ tr.header-selected td button {
   font-weight: 500;
 }
 
+.stat-download-btn {
+  all: unset;
+  cursor: pointer;
+  display: block;
+  width: 100%;
+}
+
 .progress-card {
   background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
   color: white;
@@ -355,4 +362,3 @@ tr.header-selected td button {
   font-size: 13px;
   opacity: 0.95;
 }
-

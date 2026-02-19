@@ -59,7 +59,7 @@ describe('AppComponent', () => {
 
     app.workbook = {
       SheetNames: ['Big'],
-      Sheets: { Big: { '!ref': 'A1:Z200001' } as XLSX.WorkSheet }
+      Sheets: { Big: { '!ref': 'A1:Z500001' } as XLSX.WorkSheet }
     } as XLSX.WorkBook;
     app.selectedSheet = 'Big';
 

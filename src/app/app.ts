@@ -1,4 +1,4 @@
-import { Component, NgZone, ChangeDetectorRef, OnInit, OnDestroy } from '@angular/core';
+﻿import { Component, NgZone, ChangeDetectorRef, OnInit, OnDestroy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import type { WorkBook, WorkSheet } from 'xlsx';
@@ -45,16 +45,22 @@ export class AppComponent implements OnInit, OnDestroy {
     invalidLength: 0
   };
   showStats = false;
+  statDownloads = {
+    valid: [] as Array<{ row: number; column: string; original: string; cleaned: string }>,
+    duplicates: [] as Array<{ row: number; mobile: string }>,
+    invalidPattern: [] as Array<{ row: number; column: string; value: string }>,
+    invalidLength: [] as Array<{ row: number; column: string; value: string }>
+  };
 
   /* Export Options */
-  exportMode: 'full' | 'unique' | 'mobile-name' = 'full';
+  exportMode: 'full' | 'unique' | 'mobile-name' | 'keep-all' = 'full';
   selectedNameColumn: number | null = null;
 
-  private readonly MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
-  private readonly MAX_SHEET_ROWS = 150000;
-  private readonly MAX_SHEET_COLUMNS = 200;
-  private readonly MAX_SHEET_CELLS = 2000000;
-  private readonly LARGE_SHEET_WARNING_ROWS = 50000;
+  private readonly MAX_FILE_SIZE = 150 * 1024 * 1024; // 150MB
+  private readonly MAX_SHEET_ROWS = 400000;
+  private readonly MAX_SHEET_COLUMNS = 500;
+  private readonly MAX_SHEET_CELLS = 12000000;
+  private readonly LARGE_SHEET_WARNING_ROWS = 100000;
   private readonly MAX_PREVIEW_ROWS = 50;
   private readonly MIN_VALID_MOBILES = 3;
   private readonly INVALID_PATTERNS = [
@@ -154,7 +160,7 @@ export class AppComponent implements OnInit, OnDestroy {
           // Text-based formats: CSV, TSV, TXT, XML
           if (ext === '.csv') {
             const text = result as string;
-            this.workbook = XLSX.read(text, { type: 'string', cellDates: true });
+            this.workbook = XLSX.read(text, { type: 'string', cellDates: true, dense: true });
           } else if (ext === '.tsv' || ext === '.txt') {
             const text = result as string;
             const lines = text.split(/\r\n|\n/).filter(l => l.length > 0);
@@ -165,12 +171,12 @@ export class AppComponent implements OnInit, OnDestroy {
             this.workbook = { SheetNames: ['Sheet1'], Sheets: { Sheet1: ws } } as WorkBook;
           } else if (ext === '.xml') {
             const text = result as string;
-            this.workbook = XLSX.read(text, { type: 'string', cellDates: true });
+            this.workbook = XLSX.read(text, { type: 'string', cellDates: true, dense: true });
           } else {
             // Binary formats (.xls, .xlsx, .xlsm, .xlsb, .ods)
             const data = new Uint8Array(result);
             // XLSX library does not execute macros - reading macro-enabled files is safe.
-            this.workbook = XLSX.read(data, { type: 'array', cellDates: true });
+            this.workbook = XLSX.read(data, { type: 'array', cellDates: true, dense: true });
           }
           
           if (this.DEBUG) console.log('Workbook parsed, sheets:', this.workbook?.SheetNames);
@@ -183,10 +189,10 @@ export class AppComponent implements OnInit, OnDestroy {
           this.sheetNames = this.workbook.SheetNames;
           this.selectedSheet = this.sheetNames[0];
           
-          setTimeout(() => {
+          setTimeout(async () => {
             this.isUploading = false;
             this.showSuccess('File loaded successfully');
-            void this.previewSheet();
+            await this.previewSheet();
             this.cdr.detectChanges();
           }, 300);
         } catch (error: any) {
@@ -298,6 +304,8 @@ export class AppComponent implements OnInit, OnDestroy {
     } catch (error) {
       this.showError('Failed to preview sheet');
       console.error('Preview error:', error);
+    } finally {
+      this.cdr.detectChanges();
     }
   }
 
@@ -413,6 +421,7 @@ export class AppComponent implements OnInit, OnDestroy {
       const cleaned: any[][] = [];
       const uniqueNumbers: string[] = [];
       const mobileNamePairs: any[][] = []; // Store name-mobile pairs during processing
+      const keepAllRows = this.exportMode === 'keep-all';
       const exportHeaders = this.headers.map(header => this.toExportHeader(header));
       
       cleaned.push(exportHeaders);
@@ -426,7 +435,10 @@ export class AppComponent implements OnInit, OnDestroy {
 
       console.log(`Total rows to process: ${totalRows}`);
       this.stats.total = totalRows;
-      const chunkSize = 500;
+      const chunkSize =
+        totalRows >= 200000 ? 5000 :
+        totalRows >= 100000 ? 2500 :
+        totalRows >= 50000 ? 1500 : 800;
       let processed = 0;
 
       for (let start = this.headerRowIndex + 1; start < this.rawData.length; start += chunkSize) {
@@ -444,27 +456,71 @@ export class AppComponent implements OnInit, OnDestroy {
               const perColumn: (string | null)[] = [];
 
               for (const col of this.selectedColumns) {
-                const result = this.cleanMobile(row[col], true);
-                perColumn.push(result);
-                if (result) validMobiles.push(result);
+                const detail = this.cleanMobileDetailed(row[col]);
+                perColumn.push(detail.cleanedNumbers.length > 0 ? detail.cleanedNumbers.join(' / ') : null);
+                const headerName = this.headers[col] || `Column_${col + 1}`;
+                if (detail.cleanedNumbers.length > 0) {
+                  validMobiles.push(...detail.cleanedNumbers);
+                  for (const cleanedNumber of detail.cleanedNumbers) {
+                    this.statDownloads.valid.push({
+                      row: i + 1,
+                      column: headerName,
+                      original: String(row[col] ?? ''),
+                      cleaned: cleanedNumber
+                    });
+                  }
+                } else if (detail.reason === 'invalidPattern') {
+                  this.stats.invalidPattern++;
+                  this.statDownloads.invalidPattern.push({
+                    row: i + 1,
+                    column: headerName,
+                    value: String(row[col] ?? '')
+                  });
+                } else if (detail.reason === 'invalidLength') {
+                  this.stats.invalidLength++;
+                  this.statDownloads.invalidLength.push({
+                    row: i + 1,
+                    column: headerName,
+                    value: String(row[col] ?? '')
+                  });
+                }
               }
 
-              if (validMobiles.length === 0) {
+              const rowMobiles = Array.from(new Set(validMobiles));
+
+              if (keepAllRows) {
+                this.selectedColumns.forEach((col, idx) => {
+                  if (perColumn[idx]) row[col] = perColumn[idx];
+                });
+                if (rowMobiles.length > 0) this.stats.valid += rowMobiles.length;
+                cleaned.push(row);
                 processed++;
                 continue;
               }
 
-              const primaryNumber = validMobiles[0];
-              const numberOnly = primaryNumber.replace('+91', '');
+              if (rowMobiles.length === 0) {
+                processed++;
+                continue;
+              }
 
-              if (seenNumbers.has(numberOnly)) {
+              const unseenMobiles = rowMobiles.filter(m => !seenNumbers.has(m.replace('+91', '')));
+              const duplicateMobiles = rowMobiles.filter(m => seenNumbers.has(m.replace('+91', '')));
+
+              if (unseenMobiles.length === 0) {
                 this.stats.duplicates++;
+                for (const duplicate of duplicateMobiles) {
+                  this.statDownloads.duplicates.push({ row: i + 1, mobile: duplicate });
+                }
                 processed++;
                 continue;
               }
 
-              seenNumbers.add(numberOnly);
-              uniqueNumbers.push(primaryNumber);
+              for (const number of unseenMobiles) {
+                seenNumbers.add(number.replace('+91', ''));
+                uniqueNumbers.push(number);
+              }
+
+              const primaryNumber = unseenMobiles[0];
 
               const fallback = primaryNumber;
               this.selectedColumns.forEach((col, idx) => {
@@ -472,10 +528,12 @@ export class AppComponent implements OnInit, OnDestroy {
               });
 
               // Store name-mobile pair for mobile-name export (name captured before row modification)
-              mobileNamePairs.push([name, primaryNumber]);
+              for (const number of unseenMobiles) {
+                mobileNamePairs.push([name, number]);
+              }
 
               cleaned.push(row);
-              this.stats.valid++;
+              this.stats.valid += unseenMobiles.length;
               processed++;
             } catch (rowError) {
               console.error(`Error processing row ${i}:`, rowError);
@@ -493,7 +551,7 @@ export class AppComponent implements OnInit, OnDestroy {
         await this.yieldToBrowser();
       }
 
-      if (cleaned.length <= 1 && uniqueNumbers.length === 0) {
+      if (!keepAllRows && cleaned.length <= 1 && uniqueNumbers.length === 0) {
         console.warn('No valid mobile numbers found');
         this.showError('No valid mobile numbers found in the selected columns.');
         this.isProcessing = false;
@@ -506,22 +564,31 @@ export class AppComponent implements OnInit, OnDestroy {
       const XLSX = await this.loadXlsx();
       const wb = XLSX.utils.book_new();
       let sheetAdded = false;
+      let fallbackData: any[][] = [];
+      let exportRowCount = 0;
 
-      if (this.exportMode === 'full') {
+      if (this.exportMode === 'full' || this.exportMode === 'keep-all') {
         if (cleaned.length > 1) {
-          const ws = XLSX.utils.aoa_to_sheet(cleaned);
-          XLSX.utils.book_append_sheet(wb, ws, 'Cleaned');
+          fallbackData = cleaned;
+          exportRowCount = Math.max(0, cleaned.length - 1);
+          const ws = XLSX.utils.aoa_to_sheet(cleaned.map(row => row.map(cell => this.sanitizeForExcelCell(cell))));
+          const sheetName = this.exportMode === 'keep-all' ? 'Cleaned Keep All Rows' : 'Cleaned';
+          XLSX.utils.book_append_sheet(wb, ws, sheetName);
           sheetAdded = true;
         }
       } else if (this.exportMode === 'unique') {
         const uniqueSheet = [[this.toExportHeader('Mobile Number')], ...uniqueNumbers.map(n => [n])];
-        const ws = XLSX.utils.aoa_to_sheet(uniqueSheet);
+        fallbackData = uniqueSheet;
+        exportRowCount = uniqueNumbers.length;
+        const ws = XLSX.utils.aoa_to_sheet(uniqueSheet.map(row => row.map(cell => this.sanitizeForExcelCell(cell))));
         XLSX.utils.book_append_sheet(wb, ws, 'Unique Numbers');
         sheetAdded = true;
       } else if (this.exportMode === 'mobile-name') {
         if (mobileNamePairs.length > 0) {
           const mobileNameData: any[][] = [[this.toExportHeader('Name'), this.toExportHeader('Mobile Number')], ...mobileNamePairs];
-          const ws = XLSX.utils.aoa_to_sheet(mobileNameData);
+          fallbackData = mobileNameData;
+          exportRowCount = mobileNamePairs.length;
+          const ws = XLSX.utils.aoa_to_sheet(mobileNameData.map(row => row.map(cell => this.sanitizeForExcelCell(cell))));
           XLSX.utils.book_append_sheet(wb, ws, 'Mobile & Name');
           sheetAdded = true;
         }
@@ -538,10 +605,16 @@ export class AppComponent implements OnInit, OnDestroy {
       console.log('Writing Excel file...');
 
       try {
-        const buffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+        const buffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: true });
         const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-        const prefix = this.exportMode === 'unique' ? 'Unique_' : this.exportMode === 'mobile-name' ? 'MobileName_' : 'Cleaned_';
-        const fileName = `${prefix}${this.fileName}.xlsx`;
+        const prefix = this.exportMode === 'unique'
+          ? 'Unique'
+          : this.exportMode === 'mobile-name'
+          ? 'MobileName'
+          : this.exportMode === 'keep-all'
+          ? 'CleanedKeepAll'
+          : 'Cleaned';
+        const fileName = `${exportRowCount}_clean_${this.fileName}_${prefix}.xlsx`;
         
         console.log(`Generated Excel file: ${fileName}`, { size: blob.size, rows: cleaned.length });
         
@@ -561,11 +634,28 @@ export class AppComponent implements OnInit, OnDestroy {
         
         this.progress = 100;
         this.showStats = true;
-        this.showSuccess(`Processed and downloaded successfully. ${cleaned.length} rows exported.`);
+        this.showSuccess(`Processed and downloaded successfully. ${exportRowCount} rows exported.`);
       } catch (downloadError) {
-        this.showError('Failed to download file. Check console for details.');
-        console.error('Download error:', downloadError);
-        this.progress = 0;
+        console.error('XLSX download error:', downloadError);
+        try {
+          const fallbackPrefix = this.exportMode === 'unique'
+            ? 'Unique'
+            : this.exportMode === 'mobile-name'
+            ? 'MobileName'
+            : this.exportMode === 'keep-all'
+            ? 'CleanedKeepAll'
+            : 'Cleaned';
+          const csvBlob = this.buildCsvBlob(fallbackData);
+          const csvName = `${exportRowCount}_clean_${this.fileName}_${fallbackPrefix}.csv`;
+          this.downloadBlob(csvBlob, csvName);
+          this.progress = 100;
+          this.showStats = true;
+          this.showSuccess(`XLSX export failed, downloaded CSV instead. ${exportRowCount} rows exported.`);
+        } catch (fallbackError) {
+          console.error('CSV fallback error:', fallbackError);
+          this.showError('Failed to download file. Try a smaller selection or export mode.');
+          this.progress = 0;
+        }
       } finally {
         // Small delay to ensure download initiates before resetting UI state
         setTimeout(() => {
@@ -592,44 +682,68 @@ export class AppComponent implements OnInit, OnDestroy {
   /* ================= MOBILE CLEANER ================= */
 
   cleanMobile(value: any, trackStats = false): string | null {
-    if (value === null || value === undefined || value === '') return null;
+    const detail = this.cleanMobileDetailed(value);
+    if (trackStats) {
+      if (detail.reason === 'invalidPattern') this.stats.invalidPattern++;
+      if (detail.reason === 'invalidLength') this.stats.invalidLength++;
+    }
+    return detail.cleaned;
+  }
+
+  private cleanMobileDetailed(value: any): { cleaned: string | null; cleanedNumbers: string[]; reason: 'valid' | 'invalidPattern' | 'invalidLength' | 'empty' } {
+    if (value === null || value === undefined || value === '') {
+      return { cleaned: null, cleanedNumbers: [], reason: 'empty' };
+    }
+
+    const cleanedNumbers = this.extractValidMobiles(value, 2);
+    if (cleanedNumbers.length > 0) {
+      return { cleaned: cleanedNumbers[0], cleanedNumbers, reason: 'valid' };
+    }
 
     const normalizedValue = this.normalizeMobileSource(value);
     const str = normalizedValue.replace(/[^0-9]/g, '');
     if (!str) {
-      if (trackStats) this.stats.invalidLength++;
-      return null;
+      return { cleaned: null, cleanedNumbers: [], reason: 'invalidLength' };
     }
 
     const matches = str.match(/\d{10,12}/g);
     if (!matches) {
-      if (trackStats) this.stats.invalidLength++;
-      return null;
+      return { cleaned: null, cleanedNumbers: [], reason: 'invalidLength' };
     }
 
+    const hasTenDigitLike = matches.some(num => {
+      let n = num;
+      if (n.length === 12 && n.startsWith('91')) n = n.slice(2);
+      if (n.length === 11 && n.startsWith('0')) n = n.slice(1);
+      return n.length === 10;
+    });
+
+    return { cleaned: null, cleanedNumbers: [], reason: hasTenDigitLike ? 'invalidPattern' : 'invalidLength' };
+  }
+
+  private extractValidMobiles(value: any, maxNumbers = 2): string[] {
+    const normalizedValue = this.normalizeMobileSource(value);
+    const str = normalizedValue.replace(/[^0-9]/g, '');
+    if (!str) return [];
+
+    const matches = str.match(/\d{10,12}/g);
+    if (!matches) return [];
+
+    const result: string[] = [];
     for (let num of matches) {
       if (num.length === 12 && num.startsWith('91')) num = num.slice(2);
       if (num.length === 11 && num.startsWith('0')) num = num.slice(1);
+      if (num.length !== 10) continue;
+      if (!/^[6-9]\d{9}$/.test(num)) continue;
+      if (this.isInvalidPattern(num)) continue;
 
-      if (num.length !== 10) {
-        if (trackStats) this.stats.invalidLength++;
-        continue;
+      const cleaned = `+91${num}`;
+      if (!result.includes(cleaned)) {
+        result.push(cleaned);
+        if (result.length >= maxNumbers) break;
       }
-
-      if (!/^[6-9]\d{9}$/.test(num)) {
-        if (trackStats) this.stats.invalidPattern++;
-        continue;
-      }
-
-      if (this.isInvalidPattern(num)) {
-        if (trackStats) this.stats.invalidPattern++;
-        continue;
-      }
-
-      return `+91${num}`;
     }
-
-    return null;
+    return result;
   }
 
   private normalizeMobileSource(value: any): string {
@@ -696,6 +810,30 @@ export class AppComponent implements OnInit, OnDestroy {
     return out.map(s => s.replace(/^"|"$/g, '').trim());
   }
 
+  private sanitizeForExcelCell(value: any): string | number | boolean | Date | null {
+    if (value === undefined || value === null) return null;
+    if (value instanceof Date) return value;
+    if (typeof value === 'number' || typeof value === 'boolean') return value;
+    const text = String(value);
+    // Excel cell text limit is 32767 characters.
+    return text.length > 32767 ? text.slice(0, 32767) : text;
+  }
+
+  private buildCsvBlob(data: any[][]): Blob {
+    const rows = data.map(row =>
+      row.map(cell => {
+        const normalized = this.sanitizeForExcelCell(cell);
+        const text = normalized === null ? '' : String(normalized);
+        if (/[",\n\r]/.test(text)) {
+          return `"${text.replace(/"/g, '""')}"`;
+        }
+        return text;
+      }).join(',')
+    );
+    const csv = '\uFEFF' + rows.join('\r\n');
+    return new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  }
+
   private toExportHeader(header: string): string {
     return String(header || '')
       .trim()
@@ -710,7 +848,58 @@ export class AppComponent implements OnInit, OnDestroy {
       invalidPattern: 0,
       invalidLength: 0
     };
+    this.statDownloads = {
+      valid: [],
+      duplicates: [],
+      invalidPattern: [],
+      invalidLength: []
+    };
     this.showStats = false;
+  }
+
+  async downloadStatReport(type: 'valid' | 'duplicates' | 'invalidPattern' | 'invalidLength') {
+    this.clearMessages();
+    const rows = this.statDownloads[type];
+    if (!rows.length) {
+      this.showError('No rows available for this category.');
+      return;
+    }
+
+    try {
+      const XLSX = await this.loadXlsx();
+      const wb = XLSX.utils.book_new();
+      let data: any[][] = [];
+      let sheetName = '';
+
+      if (type === 'valid') {
+        data = [[this.toExportHeader('Row'), this.toExportHeader('Column'), this.toExportHeader('Original_Value'), this.toExportHeader('Cleaned_Number')]];
+        data.push(...rows.map((r: any) => [r.row, r.column, r.original, r.cleaned]));
+        sheetName = 'Valid Numbers';
+      } else if (type === 'duplicates') {
+        data = [[this.toExportHeader('Row'), this.toExportHeader('Duplicate_Mobile')]];
+        data.push(...rows.map((r: any) => [r.row, r.mobile]));
+        sheetName = 'Duplicates Removed';
+      } else if (type === 'invalidPattern') {
+        data = [[this.toExportHeader('Row'), this.toExportHeader('Column'), this.toExportHeader('Invalid_Value')]];
+        data.push(...rows.map((r: any) => [r.row, r.column, r.value]));
+        sheetName = 'Invalid Patterns';
+      } else {
+        data = [[this.toExportHeader('Row'), this.toExportHeader('Column'), this.toExportHeader('Invalid_Value')]];
+        data.push(...rows.map((r: any) => [r.row, r.column, r.value]));
+        sheetName = 'Invalid Length Format';
+      }
+
+      const ws = XLSX.utils.aoa_to_sheet(data);
+      XLSX.utils.book_append_sheet(wb, ws, sheetName);
+      const buffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+      const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const fileName = `${this.toExportHeader(type)}_${this.fileName}.xlsx`;
+      this.downloadBlob(blob, fileName);
+      this.showSuccess(`Downloaded ${rows.length} row(s) for ${type}.`);
+    } catch (error) {
+      console.error('Stat download error:', error);
+      this.showError('Failed to download category file.');
+    }
   }
 
   /* ================= UTILITY METHODS ================= */
@@ -802,3 +991,5 @@ export class AppComponent implements OnInit, OnDestroy {
     return /\.(xls|xlsx|xlsm|xlsb|csv|tsv|txt|xml|ods)$/i.test(file.name);
   }
 }
+
+
