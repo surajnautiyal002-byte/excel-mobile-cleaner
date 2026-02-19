@@ -61,6 +61,7 @@ export class AppComponent implements OnInit, OnDestroy {
   private readonly MAX_SHEET_COLUMNS = 500;
   private readonly MAX_SHEET_CELLS = 12000000;
   private readonly LARGE_SHEET_WARNING_ROWS = 100000;
+  private readonly FAST_MODE_ROWS = 60000;
   private readonly MAX_PREVIEW_ROWS = 50;
   private readonly MIN_VALID_MOBILES = 3;
   private readonly INVALID_PATTERNS = [
@@ -74,7 +75,7 @@ export class AppComponent implements OnInit, OnDestroy {
   private errorTimer: ReturnType<typeof setTimeout> | null = null;
   private successTimer: ReturnType<typeof setTimeout> | null = null;
   private xlsxModule: typeof import('xlsx') | null = null;
-  private DEBUG = true; // set to false to reduce logging
+  private DEBUG = false;
 
   constructor(private ngZone: NgZone, private cdr: ChangeDetectorRef) {}
 
@@ -422,6 +423,8 @@ export class AppComponent implements OnInit, OnDestroy {
       const uniqueNumbers: string[] = [];
       const mobileNamePairs: any[][] = []; // Store name-mobile pairs during processing
       const keepAllRows = this.exportMode === 'keep-all';
+      const needsFullRows = this.exportMode === 'full' || this.exportMode === 'keep-all';
+      const needsMobileNamePairs = this.exportMode === 'mobile-name';
       const exportHeaders = this.headers.map(header => this.toExportHeader(header));
       
       cleaned.push(exportHeaders);
@@ -433,21 +436,25 @@ export class AppComponent implements OnInit, OnDestroy {
         return;
       }
 
-      console.log(`Total rows to process: ${totalRows}`);
+      if (this.DEBUG) console.log(`Total rows to process: ${totalRows}`);
       this.stats.total = totalRows;
+      const fastMode = totalRows >= this.FAST_MODE_ROWS;
       const chunkSize =
-        totalRows >= 200000 ? 5000 :
-        totalRows >= 100000 ? 2500 :
-        totalRows >= 50000 ? 1500 : 800;
+        totalRows >= 250000 ? 6000 :
+        totalRows >= 120000 ? 4000 :
+        totalRows >= 60000 ? 2500 : 1200;
       let processed = 0;
+      let sliceStartMs = Date.now();
 
       for (let start = this.headerRowIndex + 1; start < this.rawData.length; start += chunkSize) {
         const end = Math.min(start + chunkSize, this.rawData.length);
 
           for (let i = start; i < end; i++) {
             try {
-              const row = [...(this.rawData[i] || [])];
-              while (row.length < this.headers.length) row.push('');
+              const row = needsFullRows ? [...(this.rawData[i] || [])] : (this.rawData[i] || []);
+              if (needsFullRows) {
+                while (row.length < this.headers.length) row.push('');
+              }
 
               // Capture name BEFORE modifying the row
               const name = this.selectedNameColumn !== null ? (row[this.selectedNameColumn] || '') : '';
@@ -457,32 +464,40 @@ export class AppComponent implements OnInit, OnDestroy {
 
               for (const col of this.selectedColumns) {
                 const detail = this.cleanMobileDetailed(row[col]);
-                perColumn.push(detail.cleanedNumbers.length > 0 ? detail.cleanedNumbers.join(' / ') : null);
+                if (needsFullRows) {
+                  perColumn.push(detail.cleanedNumbers.length > 0 ? detail.cleanedNumbers.join(' / ') : null);
+                }
                 const headerName = this.headers[col] || `Column_${col + 1}`;
                 if (detail.cleanedNumbers.length > 0) {
                   validMobiles.push(...detail.cleanedNumbers);
-                  for (const cleanedNumber of detail.cleanedNumbers) {
-                    this.statDownloads.valid.push({
-                      row: i + 1,
-                      column: headerName,
-                      original: String(row[col] ?? ''),
-                      cleaned: cleanedNumber
-                    });
+                  if (!fastMode) {
+                    for (const cleanedNumber of detail.cleanedNumbers) {
+                      this.statDownloads.valid.push({
+                        row: i + 1,
+                        column: headerName,
+                        original: String(row[col] ?? ''),
+                        cleaned: cleanedNumber
+                      });
+                    }
                   }
                 } else if (detail.reason === 'invalidPattern') {
                   this.stats.invalidPattern++;
-                  this.statDownloads.invalidPattern.push({
-                    row: i + 1,
-                    column: headerName,
-                    value: String(row[col] ?? '')
-                  });
+                  if (!fastMode) {
+                    this.statDownloads.invalidPattern.push({
+                      row: i + 1,
+                      column: headerName,
+                      value: String(row[col] ?? '')
+                    });
+                  }
                 } else if (detail.reason === 'invalidLength') {
                   this.stats.invalidLength++;
-                  this.statDownloads.invalidLength.push({
-                    row: i + 1,
-                    column: headerName,
-                    value: String(row[col] ?? '')
-                  });
+                  if (!fastMode) {
+                    this.statDownloads.invalidLength.push({
+                      row: i + 1,
+                      column: headerName,
+                      value: String(row[col] ?? '')
+                    });
+                  }
                 }
               }
 
@@ -503,38 +518,54 @@ export class AppComponent implements OnInit, OnDestroy {
                 continue;
               }
 
-              const unseenMobiles = rowMobiles.filter(m => !seenNumbers.has(m.replace('+91', '')));
-              const duplicateMobiles = rowMobiles.filter(m => seenNumbers.has(m.replace('+91', '')));
+              const unseenMobiles: string[] = [];
+              const duplicateMobiles: string[] = [];
+              for (const mobile of rowMobiles) {
+                const normalized = mobile.replace('+91', '');
+                if (seenNumbers.has(normalized)) duplicateMobiles.push(mobile);
+                else unseenMobiles.push(mobile);
+              }
 
               if (unseenMobiles.length === 0) {
                 this.stats.duplicates++;
-                for (const duplicate of duplicateMobiles) {
-                  this.statDownloads.duplicates.push({ row: i + 1, mobile: duplicate });
+                if (!fastMode) {
+                  for (const duplicate of duplicateMobiles) {
+                    this.statDownloads.duplicates.push({ row: i + 1, mobile: duplicate });
+                  }
                 }
                 processed++;
                 continue;
               }
 
               for (const number of unseenMobiles) {
-                seenNumbers.add(number.replace('+91', ''));
+                const normalized = number.replace('+91', '');
+                seenNumbers.add(normalized);
                 uniqueNumbers.push(number);
               }
 
-              const primaryNumber = unseenMobiles[0];
-
-              const fallback = primaryNumber;
-              this.selectedColumns.forEach((col, idx) => {
-                row[col] = perColumn[idx] ?? fallback;
-              });
-
-              // Store name-mobile pair for mobile-name export (name captured before row modification)
-              for (const number of unseenMobiles) {
-                mobileNamePairs.push([name, number]);
+              if (needsFullRows) {
+                const primaryNumber = unseenMobiles[0];
+                const fallback = primaryNumber;
+                this.selectedColumns.forEach((col, idx) => {
+                  row[col] = perColumn[idx] ?? fallback;
+                });
+                cleaned.push(row);
               }
 
-              cleaned.push(row);
+              if (needsMobileNamePairs) {
+                for (const number of unseenMobiles) {
+                  mobileNamePairs.push([name, number]);
+                }
+              }
+
               this.stats.valid += unseenMobiles.length;
               processed++;
+
+              // Time-slice processing so the browser does not show "wait/exit" prompts.
+              if (Date.now() - sliceStartMs >= 20) {
+                await this.yieldToBrowser();
+                sliceStartMs = Date.now();
+              }
             } catch (rowError) {
               console.error(`Error processing row ${i}:`, rowError);
               this.stats.invalidLength++;
@@ -545,24 +576,30 @@ export class AppComponent implements OnInit, OnDestroy {
 
         this.progress = Math.round((processed / totalRows) * 100);
         this.cdr.detectChanges();
-        if (this.progress % 10 === 0) {
+        if (this.DEBUG && this.progress % 10 === 0) {
           console.log(`Processing progress: ${this.progress}%, Rows: ${processed}/${totalRows}, Valid: ${this.stats.valid}`);
         }
         await this.yieldToBrowser();
       }
 
       if (!keepAllRows && cleaned.length <= 1 && uniqueNumbers.length === 0) {
+        if (this.exportMode === 'mobile-name' && mobileNamePairs.length > 0) {
+          // mobile-name export does not populate cleaned rows
+        } else if (this.exportMode === 'unique' && uniqueNumbers.length > 0) {
+          // unique export does not populate cleaned rows
+        } else {
         console.warn('No valid mobile numbers found');
         this.showError('No valid mobile numbers found in the selected columns.');
         this.isProcessing = false;
         this.progress = 0;
         return;
+        }
       }
 
-      console.log(`Processing complete. Valid rows: ${this.stats.valid}, Duplicates: ${this.stats.duplicates}. Generating Excel file...`);
+      if (this.DEBUG) {
+        console.log(`Processing complete. Valid rows: ${this.stats.valid}, Duplicates: ${this.stats.duplicates}. Generating Excel file...`);
+      }
 
-      const XLSX = await this.loadXlsx();
-      const wb = XLSX.utils.book_new();
       let sheetAdded = false;
       let fallbackData: any[][] = [];
       let exportRowCount = 0;
@@ -571,25 +608,18 @@ export class AppComponent implements OnInit, OnDestroy {
         if (cleaned.length > 1) {
           fallbackData = cleaned;
           exportRowCount = Math.max(0, cleaned.length - 1);
-          const ws = XLSX.utils.aoa_to_sheet(cleaned.map(row => row.map(cell => this.sanitizeForExcelCell(cell))));
-          const sheetName = this.exportMode === 'keep-all' ? 'Cleaned Keep All Rows' : 'Cleaned';
-          XLSX.utils.book_append_sheet(wb, ws, sheetName);
           sheetAdded = true;
         }
       } else if (this.exportMode === 'unique') {
         const uniqueSheet = [[this.toExportHeader('Mobile Number')], ...uniqueNumbers.map(n => [n])];
         fallbackData = uniqueSheet;
         exportRowCount = uniqueNumbers.length;
-        const ws = XLSX.utils.aoa_to_sheet(uniqueSheet.map(row => row.map(cell => this.sanitizeForExcelCell(cell))));
-        XLSX.utils.book_append_sheet(wb, ws, 'Unique Numbers');
         sheetAdded = true;
       } else if (this.exportMode === 'mobile-name') {
         if (mobileNamePairs.length > 0) {
           const mobileNameData: any[][] = [[this.toExportHeader('Name'), this.toExportHeader('Mobile Number')], ...mobileNamePairs];
           fallbackData = mobileNameData;
           exportRowCount = mobileNamePairs.length;
-          const ws = XLSX.utils.aoa_to_sheet(mobileNameData.map(row => row.map(cell => this.sanitizeForExcelCell(cell))));
-          XLSX.utils.book_append_sheet(wb, ws, 'Mobile & Name');
           sheetAdded = true;
         }
       }
@@ -602,27 +632,50 @@ export class AppComponent implements OnInit, OnDestroy {
         return;
       }
 
-      console.log('Writing Excel file...');
+      if (this.DEBUG) console.log('Writing Excel file...');
 
       try {
+        const preferCsvForLargeExport =
+          exportRowCount >= 60000 ||
+          (this.exportMode === 'keep-all' && exportRowCount >= 40000);
+        if (preferCsvForLargeExport) {
+          const safeSheetName = this.toExportHeader(this.selectedSheet || 'Sheet1') || 'Sheet1';
+          const csvName = `${exportRowCount}_${safeSheetName}_${this.fileName}.csv`;
+          const csvBlob = this.buildCsvBlob(fallbackData);
+          this.downloadBlob(csvBlob, csvName);
+          await this.yieldToBrowser();
+          this.progress = 100;
+          this.showStats = true;
+          this.showSuccess(`Large export detected. Downloaded CSV for better stability. ${exportRowCount} rows exported.`);
+          return;
+        }
+
+        const XLSX = await this.loadXlsx();
+        const wb = XLSX.utils.book_new();
+        if (this.exportMode === 'full' || this.exportMode === 'keep-all') {
+          const ws = XLSX.utils.aoa_to_sheet(fallbackData.map(row => row.map(cell => this.sanitizeForExcelCell(cell))));
+          const sheetName = this.exportMode === 'keep-all' ? 'Cleaned Keep All Rows' : 'Cleaned';
+          XLSX.utils.book_append_sheet(wb, ws, sheetName);
+        } else if (this.exportMode === 'unique') {
+          const ws = XLSX.utils.aoa_to_sheet(fallbackData.map(row => row.map(cell => this.sanitizeForExcelCell(cell))));
+          XLSX.utils.book_append_sheet(wb, ws, 'Unique Numbers');
+        } else {
+          const ws = XLSX.utils.aoa_to_sheet(fallbackData.map(row => row.map(cell => this.sanitizeForExcelCell(cell))));
+          XLSX.utils.book_append_sheet(wb, ws, 'Mobile & Name');
+        }
+
         const buffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: true });
         const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-        const prefix = this.exportMode === 'unique'
-          ? 'Unique'
-          : this.exportMode === 'mobile-name'
-          ? 'MobileName'
-          : this.exportMode === 'keep-all'
-          ? 'CleanedKeepAll'
-          : 'Cleaned';
-        const fileName = `${exportRowCount}_clean_${this.fileName}_${prefix}.xlsx`;
+        const safeSheetName = this.toExportHeader(this.selectedSheet || 'Sheet1') || 'Sheet1';
+        const fileName = `${exportRowCount}_${safeSheetName}_${this.fileName}.xlsx`;
         
-        console.log(`Generated Excel file: ${fileName}`, { size: blob.size, rows: cleaned.length });
+        if (this.DEBUG) console.log(`Generated Excel file: ${fileName}`, { size: blob.size, rows: cleaned.length });
         
         // Trigger browser-native download outside Angular zone.
         this.ngZone.runOutsideAngular(() => {
           try {
             this.downloadBlob(blob, fileName);
-            console.log('File saved successfully');
+            if (this.DEBUG) console.log('File saved successfully');
           } catch (e) {
             console.error('download error:', e);
             throw e;
@@ -634,23 +687,25 @@ export class AppComponent implements OnInit, OnDestroy {
         
         this.progress = 100;
         this.showStats = true;
-        this.showSuccess(`Processed and downloaded successfully. ${exportRowCount} rows exported.`);
+        this.showSuccess(
+          fastMode
+            ? `Processed and downloaded successfully. ${exportRowCount} rows exported. Fast mode enabled for speed (detailed category downloads may be limited).`
+            : `Processed and downloaded successfully. ${exportRowCount} rows exported.`
+        );
       } catch (downloadError) {
         console.error('XLSX download error:', downloadError);
         try {
-          const fallbackPrefix = this.exportMode === 'unique'
-            ? 'Unique'
-            : this.exportMode === 'mobile-name'
-            ? 'MobileName'
-            : this.exportMode === 'keep-all'
-            ? 'CleanedKeepAll'
-            : 'Cleaned';
           const csvBlob = this.buildCsvBlob(fallbackData);
-          const csvName = `${exportRowCount}_clean_${this.fileName}_${fallbackPrefix}.csv`;
+          const safeSheetName = this.toExportHeader(this.selectedSheet || 'Sheet1') || 'Sheet1';
+          const csvName = `${exportRowCount}_${safeSheetName}_${this.fileName}.csv`;
           this.downloadBlob(csvBlob, csvName);
           this.progress = 100;
           this.showStats = true;
-          this.showSuccess(`XLSX export failed, downloaded CSV instead. ${exportRowCount} rows exported.`);
+          this.showSuccess(
+            fastMode
+              ? `XLSX export failed, downloaded CSV instead. ${exportRowCount} rows exported. Fast mode enabled for speed (detailed category downloads may be limited).`
+              : `XLSX export failed, downloaded CSV instead. ${exportRowCount} rows exported.`
+          );
         } catch (fallbackError) {
           console.error('CSV fallback error:', fallbackError);
           this.showError('Failed to download file. Try a smaller selection or export mode.');
@@ -661,7 +716,7 @@ export class AppComponent implements OnInit, OnDestroy {
         setTimeout(() => {
           this.isProcessing = false;
           this.cdr.detectChanges();
-          console.log('Processing complete, UI reset');
+          if (this.DEBUG) console.log('Processing complete, UI reset');
         }, 500);
       }
     } catch (error) {
@@ -675,7 +730,11 @@ export class AppComponent implements OnInit, OnDestroy {
 
   private yieldToBrowser(): Promise<void> {
     return new Promise(resolve => {
-      setTimeout(resolve, 50);
+      if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(() => resolve());
+      } else {
+        setTimeout(resolve, 0);
+      }
     });
   }
 
