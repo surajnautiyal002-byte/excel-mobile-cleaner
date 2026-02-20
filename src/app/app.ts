@@ -1,7 +1,8 @@
-﻿import { Component, NgZone, ChangeDetectorRef, OnInit, OnDestroy } from '@angular/core';
+import { Component, NgZone, ChangeDetectorRef, OnInit, OnDestroy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import type { WorkBook, WorkSheet } from 'xlsx';
+import type JSZip from 'jszip';
 
 @Component({
   selector: 'app-root',
@@ -75,6 +76,7 @@ export class AppComponent implements OnInit, OnDestroy {
   private errorTimer: ReturnType<typeof setTimeout> | null = null;
   private successTimer: ReturnType<typeof setTimeout> | null = null;
   private xlsxModule: typeof import('xlsx') | null = null;
+  private jsZipModule: typeof JSZip | null = null;
   private DEBUG = false;
 
   constructor(private ngZone: NgZone, private cdr: ChangeDetectorRef) {}
@@ -177,7 +179,20 @@ export class AppComponent implements OnInit, OnDestroy {
             // Binary formats (.xls, .xlsx, .xlsm, .xlsb, .ods)
             const data = new Uint8Array(result);
             // XLSX library does not execute macros - reading macro-enabled files is safe.
-            this.workbook = XLSX.read(data, { type: 'array', cellDates: true, dense: true });
+            try {
+              this.workbook = XLSX.read(data, { type: 'array', cellDates: true, dense: true });
+            } catch (binaryReadError: any) {
+              const message = String(binaryReadError?.message || '');
+              const canRepairZip =
+                ext === '.xlsx' &&
+                /bad compressed size|invalid zip|end of data|corrupt|crc/i.test(message);
+              if (!canRepairZip) throw binaryReadError;
+
+              if (this.DEBUG) console.warn('Primary XLSX parse failed. Attempting ZIP repair...', message);
+              const repairedData = await this.repairZipContainer(data);
+              this.workbook = XLSX.read(repairedData, { type: 'array', cellDates: true, dense: true });
+              this.showSuccess('File repaired and loaded successfully');
+            }
           }
           
           if (this.DEBUG) console.log('Workbook parsed, sheets:', this.workbook?.SheetNames);
@@ -639,8 +654,7 @@ export class AppComponent implements OnInit, OnDestroy {
           exportRowCount >= 60000 ||
           (this.exportMode === 'keep-all' && exportRowCount >= 40000);
         if (preferCsvForLargeExport) {
-          const safeSheetName = this.toExportHeader(this.selectedSheet || 'Sheet1') || 'Sheet1';
-          const csvName = `${exportRowCount}_${safeSheetName}_${this.fileName}.csv`;
+          const csvName = `(${exportRowCount})_${this.fileName}.csv`;
           const csvBlob = this.buildCsvBlob(fallbackData);
           this.downloadBlob(csvBlob, csvName);
           await this.yieldToBrowser();
@@ -666,8 +680,7 @@ export class AppComponent implements OnInit, OnDestroy {
 
         const buffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: true });
         const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-        const safeSheetName = this.toExportHeader(this.selectedSheet || 'Sheet1') || 'Sheet1';
-        const fileName = `${exportRowCount}_${safeSheetName}_${this.fileName}.xlsx`;
+        const fileName = `(${exportRowCount})_${this.fileName}.xlsx`;
         
         if (this.DEBUG) console.log(`Generated Excel file: ${fileName}`, { size: blob.size, rows: cleaned.length });
         
@@ -696,8 +709,7 @@ export class AppComponent implements OnInit, OnDestroy {
         console.error('XLSX download error:', downloadError);
         try {
           const csvBlob = this.buildCsvBlob(fallbackData);
-          const safeSheetName = this.toExportHeader(this.selectedSheet || 'Sheet1') || 'Sheet1';
-          const csvName = `${exportRowCount}_${safeSheetName}_${this.fileName}.csv`;
+          const csvName = `(${exportRowCount})_${this.fileName}.csv`;
           this.downloadBlob(csvBlob, csvName);
           this.progress = 100;
           this.showStats = true;
@@ -1000,6 +1012,25 @@ export class AppComponent implements OnInit, OnDestroy {
     return this.xlsxModule;
   }
 
+  private async loadJsZip(): Promise<typeof JSZip> {
+    if (!this.jsZipModule) {
+      const module = await import('jszip');
+      this.jsZipModule = module.default;
+    }
+    return this.jsZipModule;
+  }
+
+  private async repairZipContainer(data: Uint8Array): Promise<Uint8Array> {
+    const JSZipLib = await this.loadJsZip();
+    const zip = await JSZipLib.loadAsync(data);
+    const repaired = await zip.generateAsync({
+      type: 'uint8array',
+      compression: 'DEFLATE',
+      compressionOptions: { level: 6 }
+    });
+    return repaired;
+  }
+
   private downloadBlob(blob: Blob, fileName: string) {
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
@@ -1050,5 +1081,6 @@ export class AppComponent implements OnInit, OnDestroy {
     return /\.(xls|xlsx|xlsm|xlsb|csv|tsv|txt|xml|ods)$/i.test(file.name);
   }
 }
+
 
 
