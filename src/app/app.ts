@@ -58,11 +58,11 @@ export class AppComponent implements OnInit, OnDestroy {
   selectedNameColumn: number | null = null;
 
   private readonly MAX_FILE_SIZE = 150 * 1024 * 1024; // 150MB
-  private readonly MAX_SHEET_ROWS = 400000;
+  private readonly MAX_SHEET_ROWS = 2000000;
   private readonly MAX_SHEET_COLUMNS = 500;
-  private readonly MAX_SHEET_CELLS = 12000000;
-  private readonly LARGE_SHEET_WARNING_ROWS = 100000;
-  private readonly FAST_MODE_ROWS = 60000;
+  private readonly MAX_SHEET_CELLS = 50000000;
+  private readonly LARGE_SHEET_WARNING_ROWS = 250000;
+  private readonly FAST_MODE_ROWS = 100000;
   private readonly MAX_PREVIEW_ROWS = 50;
   private readonly MIN_VALID_MOBILES = 3;
   private readonly INVALID_PATTERNS = [
