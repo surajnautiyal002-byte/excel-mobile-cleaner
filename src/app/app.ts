@@ -27,6 +27,8 @@ export class AppComponent implements OnInit, OnDestroy {
   headerRowIndex: number | null = null;
   headers: string[] = [];
   selectedColumns: number[] = [];
+  csvStreamingFile: File | null = null;
+  csvDelimiter = ',';
 
   /* UX + Performance */
   isDragging = false;
@@ -57,7 +59,10 @@ export class AppComponent implements OnInit, OnDestroy {
   exportMode: 'full' | 'unique' | 'mobile-name' | 'keep-all' = 'full';
   selectedNameColumn: number | null = null;
 
-  private readonly MAX_FILE_SIZE = 150 * 1024 * 1024; // 150MB
+  private readonly MAX_FILE_SIZE = 500 * 1024 * 1024; // 500MB
+  private readonly MAX_XLSX_BROWSER_SAFE_SIZE = 80 * 1024 * 1024; // 80MB
+  private readonly CSV_STREAM_CHUNK_SIZE = 4 * 1024 * 1024; // 4MB
+  private readonly MAX_STAT_DOWNLOAD_ROWS = 10000;
   private readonly MAX_SHEET_ROWS = 2000000;
   private readonly MAX_SHEET_COLUMNS = 500;
   private readonly MAX_SHEET_CELLS = 50000000;
@@ -148,6 +153,58 @@ export class AppComponent implements OnInit, OnDestroy {
     const extMatch = (file.name.match(/\.[^/.]+$/) || [''])[0].toLowerCase();
     const ext = extMatch;
 
+    if (ext === '.xlsx' && file.size > this.MAX_XLSX_BROWSER_SAFE_SIZE) {
+      this.showError(
+        `This XLSX is very large (${(file.size / 1024 / 1024).toFixed(1)}MB) and may freeze the browser. ` +
+        'Please upload CSV for this dataset, or split the Excel file into smaller parts.'
+      );
+      if ('value' in target) target.value = '';
+      this.isUploading = false;
+      return;
+    }
+
+    if (ext === '.csv') {
+      this.ngZone.run(async () => {
+        try {
+          const preview = await this.loadCsvPreview(file, (p) => {
+            this.uploadProgress = Math.max(5, Math.min(100, p));
+            this.cdr.detectChanges();
+          });
+
+          clearInterval(progressInterval);
+          this.uploadProgress = 100;
+          this.workbook = null;
+          this.sheetNames = ['CSV'];
+          this.selectedSheet = 'CSV';
+          this.csvStreamingFile = file;
+          this.csvDelimiter = preview.delimiter;
+          this.rawData = preview.rows;
+          this.previewData = preview.rows.slice(0, this.MAX_PREVIEW_ROWS);
+          this.headerRowIndex = null;
+          this.headers = [];
+          this.selectedColumns = [];
+          this.showPreview = this.previewData.length > 0;
+
+          if (this.previewData.length === 0) {
+            this.showError('CSV file appears to be empty.');
+            this.isUploading = false;
+            return;
+          }
+
+          this.autoDetectHeader();
+          this.isUploading = false;
+          this.showSuccess(`CSV loaded. Previewing first ${this.previewData.length} rows.`);
+          this.cdr.detectChanges();
+        } catch (error) {
+          clearInterval(progressInterval);
+          this.isUploading = false;
+          this.showError('Failed to read CSV file. Please ensure it is valid.');
+          console.error('CSV parsing error:', error);
+        }
+      });
+      return;
+    }
+
     const reader = new FileReader();
 
     reader.onload = (e: any) => {
@@ -161,10 +218,7 @@ export class AppComponent implements OnInit, OnDestroy {
           const result = e.target.result as any;
 
           // Text-based formats: CSV, TSV, TXT, XML
-          if (ext === '.csv') {
-            const text = result as string;
-            this.workbook = XLSX.read(text, { type: 'string', cellDates: true, dense: true });
-          } else if (ext === '.tsv' || ext === '.txt') {
+          if (ext === '.tsv' || ext === '.txt') {
             const text = result as string;
             const lines = text.split(/\r\n|\n/).filter(l => l.length > 0);
             // Detect delimiter for .txt (prefer tab for .tsv)
@@ -178,6 +232,17 @@ export class AppComponent implements OnInit, OnDestroy {
           } else {
             // Binary formats (.xls, .xlsx, .xlsm, .xlsb, .ods)
             const data = new Uint8Array(result);
+            if (ext === '.xlsx') {
+              const preflight = await this.preflightXlsxComplexity(data);
+              if (preflight.error) {
+                this.showError(preflight.error);
+                this.isUploading = false;
+                return;
+              }
+              if (preflight.warning) {
+                this.showSuccess(preflight.warning);
+              }
+            }
             // XLSX library does not execute macros - reading macro-enabled files is safe.
             try {
               this.workbook = XLSX.read(data, { type: 'array', cellDates: true, dense: true });
@@ -424,6 +489,11 @@ export class AppComponent implements OnInit, OnDestroy {
       return;
     }
 
+    if (this.csvStreamingFile) {
+      await this.cleanAndDownloadCsvStreaming();
+      return;
+    }
+
     if (this.isProcessing) return;
 
     try {
@@ -487,7 +557,7 @@ export class AppComponent implements OnInit, OnDestroy {
                   validMobiles.push(...detail.cleanedNumbers);
                   if (!fastMode) {
                     for (const cleanedNumber of detail.cleanedNumbers) {
-                      this.statDownloads.valid.push({
+                      this.addLimitedStatRow('valid', {
                         row: i + 1,
                         column: headerName,
                         original: String(row[col] ?? ''),
@@ -498,7 +568,7 @@ export class AppComponent implements OnInit, OnDestroy {
                 } else if (detail.reason === 'invalidPattern') {
                   this.stats.invalidPattern++;
                   if (!fastMode) {
-                    this.statDownloads.invalidPattern.push({
+                    this.addLimitedStatRow('invalidPattern', {
                       row: i + 1,
                       column: headerName,
                       value: String(row[col] ?? '')
@@ -507,7 +577,7 @@ export class AppComponent implements OnInit, OnDestroy {
                 } else if (detail.reason === 'invalidLength') {
                   this.stats.invalidLength++;
                   if (!fastMode) {
-                    this.statDownloads.invalidLength.push({
+                    this.addLimitedStatRow('invalidLength', {
                       row: i + 1,
                       column: headerName,
                       value: String(row[col] ?? '')
@@ -545,7 +615,7 @@ export class AppComponent implements OnInit, OnDestroy {
                 this.stats.duplicates++;
                 if (!fastMode) {
                   for (const duplicate of duplicateMobiles) {
-                    this.statDownloads.duplicates.push({ row: i + 1, mobile: duplicate });
+                    this.addLimitedStatRow('duplicates', { row: i + 1, mobile: duplicate });
                   }
                 }
                 processed++;
@@ -654,7 +724,7 @@ export class AppComponent implements OnInit, OnDestroy {
           exportRowCount >= 60000 ||
           (this.exportMode === 'keep-all' && exportRowCount >= 40000);
         if (preferCsvForLargeExport) {
-          const csvName = `(${exportRowCount})_${this.fileName}.csv`;
+          const csvName = `(${exportRowCount})-${this.fileName}.csv`;
           const csvBlob = this.buildCsvBlob(fallbackData);
           this.downloadBlob(csvBlob, csvName);
           await this.yieldToBrowser();
@@ -680,7 +750,7 @@ export class AppComponent implements OnInit, OnDestroy {
 
         const buffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: true });
         const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-        const fileName = `(${exportRowCount})_${this.fileName}.xlsx`;
+        const fileName = `(${exportRowCount})-${this.fileName}.xlsx`;
         
         if (this.DEBUG) console.log(`Generated Excel file: ${fileName}`, { size: blob.size, rows: cleaned.length });
         
@@ -709,7 +779,7 @@ export class AppComponent implements OnInit, OnDestroy {
         console.error('XLSX download error:', downloadError);
         try {
           const csvBlob = this.buildCsvBlob(fallbackData);
-          const csvName = `(${exportRowCount})_${this.fileName}.csv`;
+          const csvName = `(${exportRowCount})-${this.fileName}.csv`;
           this.downloadBlob(csvBlob, csvName);
           this.progress = 100;
           this.showStats = true;
@@ -905,6 +975,283 @@ export class AppComponent implements OnInit, OnDestroy {
     return new Blob([csv], { type: 'text/csv;charset=utf-8;' });
   }
 
+  private csvEscape(value: any): string {
+    const normalized = this.sanitizeForExcelCell(value);
+    const text = normalized === null ? '' : String(normalized);
+    if (/[",\n\r]/.test(text)) {
+      return `"${text.replace(/"/g, '""')}"`;
+    }
+    return text;
+  }
+
+  private async loadCsvPreview(file: File, onProgress?: (progress: number) => void): Promise<{ rows: string[][]; delimiter: string }> {
+    const rows: string[][] = [];
+    let delimiter = ',';
+    let delimiterDetected = false;
+    let rowCount = 0;
+
+    await this.streamCsvLines(
+      file,
+      (line) => {
+        if (!delimiterDetected) {
+          delimiter = this.detectDelimiter(line);
+          delimiterDetected = true;
+        }
+        rows.push(this.parseLine(line, delimiter));
+        rowCount++;
+        return rowCount < this.MAX_PREVIEW_ROWS;
+      },
+      onProgress
+    );
+
+    return { rows, delimiter };
+  }
+
+  private async streamCsvLines(
+    file: File,
+    onLine: (line: string) => boolean | void | Promise<boolean | void>,
+    onProgress?: (progress: number) => void
+  ): Promise<void> {
+    const decoder = new TextDecoder('utf-8');
+    let offset = 0;
+    let leftover = '';
+    let shouldContinue = true;
+
+    while (offset < file.size && shouldContinue) {
+      const next = Math.min(offset + this.CSV_STREAM_CHUNK_SIZE, file.size);
+      const buffer = await file.slice(offset, next).arrayBuffer();
+      offset = next;
+
+      const text = decoder.decode(buffer, { stream: offset < file.size });
+      const merged = leftover + text;
+      const lines = merged.split(/\r\n|\n/);
+      leftover = lines.pop() ?? '';
+
+      for (const line of lines) {
+        const result = await onLine(line);
+        if (result === false) {
+          shouldContinue = false;
+          break;
+        }
+      }
+
+      if (onProgress) {
+        onProgress(Math.round((offset / file.size) * 100));
+      }
+      await this.yieldToBrowser();
+    }
+
+    if (shouldContinue && leftover.length > 0) {
+      await onLine(leftover);
+      if (onProgress) onProgress(100);
+    }
+  }
+
+  private addLimitedStatRow(type: 'valid' | 'duplicates' | 'invalidPattern' | 'invalidLength', row: any) {
+    const bucket = this.statDownloads[type] as any[];
+    if (bucket.length < this.MAX_STAT_DOWNLOAD_ROWS) {
+      bucket.push(row);
+    }
+  }
+
+  private async cleanAndDownloadCsvStreaming() {
+    if (!this.csvStreamingFile) return;
+    if (this.isProcessing) return;
+
+    this.isProcessing = true;
+    this.progress = 0;
+    this.resetStats();
+
+    try {
+      const file = this.csvStreamingFile;
+      const keepAllRows = this.exportMode === 'keep-all';
+      const needsFullRows = this.exportMode === 'full' || this.exportMode === 'keep-all';
+      const needsMobileNamePairs = this.exportMode === 'mobile-name';
+      const seenNumbers = new Set<string>();
+      let delimiter = this.csvDelimiter || ',';
+      let delimiterDetected = false;
+      let rowIndex = -1;
+      let exportRowCount = 0;
+      let headerWritten = false;
+      let dataRowsProcessed = 0;
+
+      const csvParts: string[] = ['\uFEFF'];
+      let csvBuffer = '';
+      let bufferedLines = 0;
+      const flushCsvBuffer = () => {
+        if (csvBuffer.length === 0) return;
+        csvParts.push(csvBuffer);
+        csvBuffer = '';
+        bufferedLines = 0;
+      };
+      const appendCsvLine = (line: string) => {
+        csvBuffer += line;
+        bufferedLines++;
+        if (bufferedLines >= 2000 || csvBuffer.length >= 2 * 1024 * 1024) {
+          flushCsvBuffer();
+        }
+      };
+
+      await this.streamCsvLines(
+        file,
+        async (line) => {
+          rowIndex++;
+          if (!delimiterDetected) {
+            delimiter = this.detectDelimiter(line);
+            delimiterDetected = true;
+          }
+
+          const row = this.parseLine(line, delimiter);
+          if (rowIndex < (this.headerRowIndex ?? 0)) return true;
+
+          if (rowIndex === this.headerRowIndex) {
+            if (this.exportMode === 'full' || this.exportMode === 'keep-all') {
+              const exportHeaders = this.headers.map(header => this.toExportHeader(header));
+              appendCsvLine(exportHeaders.map(v => this.csvEscape(v)).join(',') + '\r\n');
+            } else if (this.exportMode === 'unique') {
+              appendCsvLine(`${this.csvEscape(this.toExportHeader('Mobile Number'))}\r\n`);
+            } else {
+              appendCsvLine(`${this.csvEscape(this.toExportHeader('Name'))},${this.csvEscape(this.toExportHeader('Mobile Number'))}\r\n`);
+            }
+            headerWritten = true;
+            return true;
+          }
+
+          if (!headerWritten) return true;
+          dataRowsProcessed++;
+          this.stats.total = dataRowsProcessed;
+
+          if (row.length < this.headers.length) {
+            while (row.length < this.headers.length) row.push('');
+          }
+
+          const name = this.selectedNameColumn !== null ? (row[this.selectedNameColumn] || '') : '';
+          const validMobiles: string[] = [];
+          const perColumn: (string | null)[] = [];
+
+          for (const col of this.selectedColumns) {
+            const detail = this.cleanMobileDetailed(row[col]);
+            if (needsFullRows) {
+              perColumn.push(detail.cleanedNumbers.length > 0 ? detail.cleanedNumbers.join(' / ') : null);
+            }
+            const headerName = this.headers[col] || `Column_${col + 1}`;
+
+            if (detail.cleanedNumbers.length > 0) {
+              validMobiles.push(...detail.cleanedNumbers);
+              for (const cleanedNumber of detail.cleanedNumbers) {
+                this.addLimitedStatRow('valid', {
+                  row: rowIndex + 1,
+                  column: headerName,
+                  original: String(row[col] ?? ''),
+                  cleaned: cleanedNumber
+                });
+              }
+            } else if (detail.reason === 'invalidPattern') {
+              this.stats.invalidPattern++;
+              this.addLimitedStatRow('invalidPattern', {
+                row: rowIndex + 1,
+                column: headerName,
+                value: String(row[col] ?? '')
+              });
+            } else if (detail.reason === 'invalidLength') {
+              this.stats.invalidLength++;
+              this.addLimitedStatRow('invalidLength', {
+                row: rowIndex + 1,
+                column: headerName,
+                value: String(row[col] ?? '')
+              });
+            }
+          }
+
+          const rowMobiles = Array.from(new Set(validMobiles));
+          if (keepAllRows) {
+            this.selectedColumns.forEach((col, idx) => {
+              if (perColumn[idx]) row[col] = perColumn[idx] as string;
+            });
+            if (rowMobiles.length > 0) this.stats.valid += rowMobiles.length;
+            appendCsvLine(row.map(v => this.csvEscape(v)).join(',') + '\r\n');
+            exportRowCount++;
+            return true;
+          }
+
+          if (rowMobiles.length === 0) return true;
+
+          const unseenMobiles: string[] = [];
+          const duplicateMobiles: string[] = [];
+          for (const mobile of rowMobiles) {
+            const normalized = mobile.replace('+91', '');
+            if (seenNumbers.has(normalized)) duplicateMobiles.push(mobile);
+            else unseenMobiles.push(mobile);
+          }
+
+          if (unseenMobiles.length === 0) {
+            this.stats.duplicates++;
+            for (const duplicate of duplicateMobiles) {
+              this.addLimitedStatRow('duplicates', { row: rowIndex + 1, mobile: duplicate });
+            }
+            return true;
+          }
+
+          for (const number of unseenMobiles) {
+            seenNumbers.add(number.replace('+91', ''));
+          }
+          this.stats.valid += unseenMobiles.length;
+
+          if (this.exportMode === 'unique') {
+            for (const number of unseenMobiles) {
+              appendCsvLine(this.csvEscape(number) + '\r\n');
+              exportRowCount++;
+            }
+            return true;
+          }
+
+          if (needsMobileNamePairs) {
+            for (const number of unseenMobiles) {
+              appendCsvLine(`${this.csvEscape(name)},${this.csvEscape(number)}\r\n`);
+              exportRowCount++;
+            }
+            return true;
+          }
+
+          // full export
+          const primary = unseenMobiles[0];
+          this.selectedColumns.forEach((col, idx) => {
+            row[col] = perColumn[idx] ?? primary;
+          });
+          appendCsvLine(row.map(v => this.csvEscape(v)).join(',') + '\r\n');
+          exportRowCount++;
+          return true;
+        },
+        (progress) => {
+          this.progress = progress;
+          this.cdr.detectChanges();
+        }
+      );
+
+      if (exportRowCount <= 0) {
+        this.showError('No valid mobile numbers found in the selected columns.');
+        this.progress = 0;
+        this.isProcessing = false;
+        return;
+      }
+
+      flushCsvBuffer();
+      const blob = new Blob(csvParts, { type: 'text/csv;charset=utf-8;' });
+      const fileName = `(${exportRowCount})-${this.fileName}.csv`;
+      this.downloadBlob(blob, fileName);
+      this.progress = 100;
+      this.showStats = true;
+      this.showSuccess(`Processed and downloaded successfully. ${exportRowCount} rows exported.`);
+    } catch (error) {
+      console.error('CSV streaming processing error:', error);
+      this.showError('Failed to process large CSV. Please try again with a split file.');
+      this.progress = 0;
+    } finally {
+      this.isProcessing = false;
+      this.cdr.detectChanges();
+    }
+  }
+
   private toExportHeader(header: string): string {
     return String(header || '')
       .trim()
@@ -1020,6 +1367,45 @@ export class AppComponent implements OnInit, OnDestroy {
     return this.jsZipModule;
   }
 
+  private async preflightXlsxComplexity(data: Uint8Array): Promise<{ error?: string; warning?: string }> {
+    try {
+      const JSZipLib = await this.loadJsZip();
+      const zip = await JSZipLib.loadAsync(data);
+      const worksheetEntries = Object.values((zip as any).files || {}).filter((entry: any) => {
+        const name = String(entry?.name || '');
+        return /^xl\/worksheets\/sheet\d+\.xml$/i.test(name);
+      }) as any[];
+      if (!worksheetEntries.length) return {};
+
+      let maxSheetXmlSize = 0;
+      for (const entry of worksheetEntries) {
+        const size = Number(entry?._data?.uncompressedSize || 0);
+        if (Number.isFinite(size) && size > maxSheetXmlSize) {
+          maxSheetXmlSize = size;
+        }
+      }
+      if (maxSheetXmlSize <= 0) return {};
+
+      const TOO_LARGE_XML = 250 * 1024 * 1024; // 250MB uncompressed worksheet XML
+      const LARGE_XML_WARNING = 120 * 1024 * 1024; // 120MB warning
+
+      if (maxSheetXmlSize > TOO_LARGE_XML) {
+        return {
+          error: 'This XLSX is too complex for browser memory. Please save/export it as CSV and upload CSV, or split the workbook into smaller files.'
+        };
+      }
+      if (maxSheetXmlSize > LARGE_XML_WARNING) {
+        return {
+          warning: 'Large XLSX detected. Processing may be slow; CSV format is recommended for best performance.'
+        };
+      }
+      return {};
+    } catch {
+      // If preflight fails, continue with normal parse path.
+      return {};
+    }
+  }
+
   private async repairZipContainer(data: Uint8Array): Promise<Uint8Array> {
     const JSZipLib = await this.loadJsZip();
     const zip = await JSZipLib.loadAsync(data);
@@ -1052,6 +1438,8 @@ export class AppComponent implements OnInit, OnDestroy {
     this.headers = [];
     this.selectedColumns = [];
     this.selectedNameColumn = null;
+    this.csvStreamingFile = null;
+    this.csvDelimiter = ',';
     this.rawData = [];
     this.previewData = [];
     this.resetStats();
